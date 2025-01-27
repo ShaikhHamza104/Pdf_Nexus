@@ -1,3 +1,4 @@
+import textwrap
 from PyPDF2 import PdfWriter, PdfMerger, PdfReader
 import os
 import streamlit as st
@@ -8,9 +9,10 @@ import pytesseract
 import fitz  # PyMuPDF for handling PDFs
 import pandas as pd
 import spacy
+import torch
 from transformers import pipeline
 import numpy as np
-
+from torch import Tensor
 def pdf_reader(pdf_file):
     """
     Read PDF and extract text and metadata.
@@ -92,6 +94,7 @@ def merge_pdfs(pdf_files):
         st.error(f"PDF merge error: {e}")
         return None
 
+
 def extract_pdf_images_and_tables(pdf_file):
     """
     Extract images and tables from a PDF.
@@ -114,7 +117,12 @@ def extract_pdf_images_and_tables(pdf_file):
                     try:
                         # Ensure table has at least a header row
                         if table and len(table) > 1:
-                            df = pd.DataFrame(table[1:], columns=table[0])
+                            # Handle duplicate columns by renaming them
+                            columns = table[0]
+                            columns = [f"{col}_{i}" if columns.count(col) > 1 else col for i, col in enumerate(columns)]
+                            
+                            # Create DataFrame
+                            df = pd.DataFrame(table[1:], columns=columns)
                             tables.append((f"Page {page_num + 1} Table {table_idx + 1}", df))
                     except Exception as table_error:
                         st.warning(f"Could not process table on page {page_num + 1}: {table_error}")
@@ -133,7 +141,7 @@ def extract_pdf_images_and_tables(pdf_file):
     except Exception as e:
         st.error(f"PDF image and table extraction error: {e}")
         return [], []
-
+    
 def extract_keywords(pdf_file):
     """
     Extract keywords using spaCy NLP.
@@ -170,44 +178,80 @@ def extract_keywords(pdf_file):
     except Exception as e:
         st.error(f"Keyword extraction error: {e}")
         return []
-    
+
+
 def pdf_summarizer(pdf_file):
     """
     Generate a summary of the PDF content.
     
     Args:
-        pdf_file: PDF file to summarize
+        pdf_file: PDF file to summarize. Should specify the expected type (e.g., Path, file object, or bytes)
     
     Returns:
-        Summarized text
+        str: Summarized text or error message
     """
     try:
         # Extract text from PDF
         with pdfplumber.open(pdf_file) as pdf:
             text = "\n".join([page.extract_text() or "" for page in pdf.pages])
         
-        # Truncate text if too long to avoid memory issues
-        max_text_length = 10000
-        if len(text) > max_text_length:
-            text = text[:max_text_length]
-
-        # Use Hugging Face summarization pipeline
-        summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        if not text.strip():
+            return "The PDF appears to be empty or contains no extractable text."
+            
+        # Use smaller chunks to stay within BART's limits (1024 tokens ≈ 750-1000 words)
+        chunk_size = 1000  # Reduced chunk size
+        chunks = textwrap.wrap(text, chunk_size, break_long_words=False, break_on_hyphens=False)
         
-        # Generate summary with more robust parameters
-        summary = summarizer(
-            text, 
-            max_length=300, 
-            min_length=100, 
-            do_sample=False,
+        # Initialize summarizer with explicit model max length
+        summarizer = pipeline(
+            "summarization",
+            model="facebook/bart-large-cnn",
+            device=torch.cuda.is_available() and "cuda" or "cpu",
+            min_length=30,
             truncation=True
         )
+        
+        summaries = []
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+                
+            try:
+                # Remove max_length from here since it's set in pipeline initialization
+                chunk_summary = summarizer(
+                    chunk,
+                    do_sample=False,
+                    num_beams=4
+                )
+                if chunk_summary and len(chunk_summary) > 0:
+                    summaries.append(chunk_summary[0]['summary_text'])
+            except Exception as e:
+                print(f"Chunk processing error: {str(e)}")
+                continue
+        
+        if not summaries:
+            return "Could not generate a summary from the PDF content."
+            
+        final_summary = " ".join(summaries)
+        
+        # Second summarization if needed
+        if len(final_summary) > chunk_size:
+            try:
+                final_summary = summarizer(
+                    final_summary,
+                    do_sample=False,
+                    num_beams=4
+                )[0]['summary_text']
+            except Exception as e:
+                print(f"Final summarization error: {str(e)}")
+        
+        return final_summary.strip()
 
-        return summary[0]['summary_text']
     except Exception as e:
-        st.error(f"PDF Summarization error: {e}")
-        return ""
-
+        error_msg = f"PDF Summarization error: {str(e)}"
+        print(error_msg)
+        return error_msg
+    
 def pdf_semantic_analysis(pdf_file):
     """
     Perform basic semantic analysis on PDF content.
